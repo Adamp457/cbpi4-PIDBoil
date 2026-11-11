@@ -1,9 +1,16 @@
 import asyncio
-from asyncio import tasks
 import logging
 from cbpi.api import *
+from cbpi.api.dataclasses import NotificationType
 import time
-import datetime
+
+from .guard import Guard, GuardConfig, unit_defaults
+
+
+def _help(key, text):
+    """Description with the default in both units: the form can't know CBPi's Temp Unit."""
+    return f"{text}. Empty = {unit_defaults('C')[key]:g} (°C) / {unit_defaults('F')[key]:g} (°F)"
+
 
 @parameters([Property.Number(label = "P", configurable = True, description="P Value of PID"),
              Property.Number(label = "I", configurable = True, description="I Value of PID"),
@@ -11,10 +18,64 @@ import datetime
              Property.Select(label="SampleTime", options=[2,5], description="PID Sample time in seconds. Default: 5 (How often is the output calculation done)"),
              Property.Number(label = "Max_Output", configurable = True, description="Power before Boil threshold is reached."),
              Property.Number(label = "Boil_Threshold", configurable = True, description="When this temperature is reached, power will be set to Max Boil Output (default: 98 °C/208 F)"),
-             Property.Number(label = "Max_Boil_Output", configurable = True, default_value = 85, description="Power when Boil Threshold is reached.")])
+             Property.Number(label = "Max_Boil_Output", configurable = True, default_value = 85, description="Power when Boil Threshold is reached."),
+             # Guards (fork). Any fault turns the heater off and latches until the kettle is restarted.
+             Property.Number(label = "MaxTemp", configurable = True, description=_help("MaxTemp", "Fault above this kettle temperature (boiled dry, probe out of the liquid)")),
+             Property.Number(label = "MaxAge", configurable = True, description="Fault if the probe has not updated for this long, s (MQTT sensors need Timeout > 0). 0 = off. Empty = 30"),
+             Property.Number(label = "FrozenTime", configurable = True, description="Below the boil threshold: fault if the probe reads exactly the same for this long with the heater at 50 % or more, s. 0 = off. Empty = 300"),
+             Property.Number(label = "RiseTime", configurable = True, description=_help("RiseMin", "Below the boil threshold: fault if the heater is at 50 % or more for RiseTime s (empty = 900, 0 = off) and the kettle rises less than this")),
+             Property.Sensor(label = "AppliedSensor", description="Optional: the panel's applied heater power in % (MQTTDevice32pIO power-share <topic>/applied). Fault if the heater is commanded on and the panel applies 0 for 30 s")])
 
 class PIDBoil(CBPiKettleLogic):
 
+    def _num(self, key, defaults):
+        value = self.props.get(key)
+        return float(defaults[key] if value in (None, "") else value)
+
+    def _guard(self, unit, boil_threshold):
+        d = unit_defaults(unit)
+        return Guard(GuardConfig(
+            max_age=self._num("MaxAge", d), frozen_time=self._num("FrozenTime", d),
+            rise_time=self._num("RiseTime", d), rise_min=d["RiseMin"], guard_power=d["GuardPower"],
+            temp_min=d["TempMin"], temp_max=d["TempMax"], max_temp=self._num("MaxTemp", d),
+            boil_threshold=boil_threshold))
+
+    def _reading(self, now):
+        try:
+            value = float(self.get_sensor_value(self.kettle.sensor).get("value"))
+        except (AttributeError, TypeError, ValueError):
+            return None, now
+        sensor = self.cbpi.sensor.find_by_id(self.kettle.sensor)
+        # MQTTSensor stamps lastdata per message (only when its Timeout > 0). Sensors
+        # without it skip the age check; the frozen-reading guard covers them.
+        return value, getattr(getattr(sensor, "instance", None), "lastdata", now)
+
+    def _applied(self, now):
+        sensor_id = self.props.get("AppliedSensor")
+        if not sensor_id:
+            return None
+        try:
+            value = float(self.get_sensor_value(sensor_id).get("value"))
+        except (AttributeError, TypeError, ValueError):
+            return None, now
+        sensor = self.cbpi.sensor.find_by_id(sensor_id)
+        return value, getattr(getattr(sensor, "instance", None), "lastdata", now)
+
+    async def _force_off(self):
+        # CBPi's actor.off() does nothing once it thinks the actor is off, and MQTTActor marks
+        # itself off before publishing. Calling the actor's own off() again re-publishes it.
+        if self.get_actor_state(self.heater):
+            return await self.actor_off(self.heater)
+        actor = self.cbpi.actor.find_by_id(self.heater)
+        if actor is not None and actor.instance is not None:
+            try:
+                await actor.instance.off()
+            except Exception:
+                logging.warning("PIDBoil %s: could not re-send heater off", self.id)
+
+    def _status(self, state, power, reason, temp):
+        self.cbpi.push_update(f"cbpi/pidboil/{self.id}", dict(
+            state=state, power=round(power), reason=reason, temp=temp))
 
     async def on_stop(self):
         await self.actor_off(self.heater)
@@ -34,32 +95,47 @@ class PIDBoil(CBPiKettleLogic):
             maxboilout = int(self.props.get("Max_Boil_Output", 100))
             self.kettle = self.get_kettle(self.id)
             self.heater = self.kettle.heater
-            heat_percent_old = maxout
+            heat_percent_old = 0
             self.heater_actor = self.cbpi.actor.find_by_id(self.heater)
-                       
-            await self.actor_on(self.heater, maxout)
+            guard = self._guard(self.TEMP_UNIT, maxtempboil)
+            fault = None
 
             pid = PIDArduino(sampleTime, p, i, d, 0, maxout)
 
             while self.running == True:
-                current_kettle_power= self.heater_actor.power
-                sensor_value = current_temp = self.get_sensor_value(self.kettle.sensor).get("value")
+                now = time.time()
+                current_temp, received_at = self._reading(now)
+                if fault is None and (fault := guard.check(now, current_temp, received_at, heat_percent_old, self._applied(now))):
+                    logging.warning("PIDBoil %s fault: %s", self.id, fault)
+                    self.cbpi.notify("PIDBoil", f"{self.kettle.name}: heater off: {fault}. "
+                                     "Restart the kettle to re-arm.", NotificationType.ERROR)
+                if fault:
+                    # Re-sent every sample, so a lost off can't leave the element on.
+                    await self._force_off()
+                    heat_percent_old = 0
+                    self._status("fault", 0, fault, current_temp)
+                    await asyncio.sleep(sampleTime)
+                    continue
+
                 target_temp = self.get_kettle_target_temp(self.id)
                 if current_temp >= float(maxtempboil):
                     heat_percent = maxboilout
                 else:
-                    heat_percent = pid.calc(sensor_value, target_temp)
+                    heat_percent = pid.calc(current_temp, target_temp)
 
-                
-                if (heat_percent_old != heat_percent) or (heat_percent != current_kettle_power):
+                # Upstream switched on at Max_Output before reading the probe; now on only after the first good check.
+                if not self.get_actor_state(self.heater):
+                    await self.actor_on(self.heater, heat_percent)
+                elif (heat_percent_old != heat_percent) or (heat_percent != self.heater_actor.power):
                     await self.actor_set_power(self.heater, heat_percent)
-                    heat_percent_old= heat_percent
+                heat_percent_old = heat_percent
+                self._status("running", heat_percent, None, current_temp)
                 await asyncio.sleep(sampleTime)
 
         except asyncio.CancelledError as e:
             pass
         except Exception as e:
-            logging.error("BM_PIDSmartBoilWithPump Error {}".format(e))
+            logging.exception("PIDBoil Error {}".format(e))
         finally:
             self.running = False
             await self.actor_off(self.heater)
