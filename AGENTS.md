@@ -34,7 +34,10 @@ A second throwaway container on the HERMS dev rig's private Mosquitto, with an
 `MQTTActor` heater, checked the faulted kettle: it published `off` 6 times in
 10 s (`SampleTime` 2), and `cbpi/pidboil/<id>` carried the fault reason.
 
-Unit tests only: the boil-plateau exemption and `AppliedSensor`. Not run on production or with real
-DS18B20 noise.
+Unit tests only: the boil-plateau exemption and `AppliedSensor`.
+
+On the operator's production CBPi since 2026-11-11 22:07, replacing upstream
+0.0.9: loads, offers the new properties. It hasn't run a kettle there yet, and
+hasn't seen real DS18B20 noise.
 
 Gotcha found while testing: a kettle `PUT` without `target_temp` resets the target to 0.
